@@ -1,0 +1,1201 @@
+from colorama import Fore, Style
+import typing
+import argparse
+import os
+import pickle
+import sys
+import copy
+
+
+os.system("")  # enables colors
+
+
+def debug_print(*msg):
+    if DEBUG_MODE:
+        print(Fore.CYAN + "[DEBUG]" + ' '.join(str(el) for el in msg) + Style.RESET_ALL)
+
+
+def flatten(lst):
+    for x in lst:
+        if hasattr(x, '__iter__') and not isinstance(x, str):
+            for y in flatten(x):
+                yield y
+        else:
+            yield x
+
+
+# helper classes
+
+class Token:
+
+    def __init__(self, _type, value, line):
+        self.type = _type
+        self.value = value
+        self.line = line
+
+    def __eq__(self, other):
+        if isinstance(other, Token):
+            return self.type == other.type and self.value == other.value
+        else:
+            return False
+
+    def __repr__(self):
+        return f"Token(type={repr(self.type)}, value={repr(self.value)}, line={repr(self.line)})"
+
+
+class Scope:
+
+    def __init__(self, *levels):
+        self.levels = list(flatten(levels))
+        self.__iter_index = -1
+
+    def __sub__(self, other):
+        return len(self.levels) - other
+
+    def __isub__(self, other):
+        return Scope(self.levels[:-other])
+
+    def __add__(self, other):
+        return Scope(self.levels, other)
+
+    def __getitem__(self, item):
+        return self.levels[item]
+
+    def __setitem__(self, key, value):
+        self.levels[key] = value
+
+    def __len__(self):
+        return len(self.levels)
+
+    def __iter__(self):
+        self.__iter_index = -1
+        return self
+
+    def __next__(self):
+        try:
+            self.__iter_index += 1
+            return self.levels[self.__iter_index]
+        except IndexError:
+            raise StopIteration
+
+    def __repr__(self):
+        return repr(self.levels)
+
+    def get_next_index(self, ast):
+        return len(self.get_ast_scope(ast)) - 1
+
+    def add_next_index(self, ast):
+        self + self.get_next_index(ast)
+
+    def get_ast_scope(self, ast):
+        accumulator = ast
+        for level in self.levels:
+            accumulator = accumulator[level]
+        return accumulator
+
+
+# data types
+class Function:
+
+    def __init__(self, params, body, parents, isref=False):
+        self.params = params
+        self.body = body
+        self.parents = parents
+        self.isref = isref
+
+    def __repr__(self):
+        return "<Function>"
+
+    def run(self, params):
+        e = EzyLang("<String>", code=self.body, initscope="func", parents=self.parents, func=self)
+        e.compile()
+        return e.run(params=params)
+
+
+class BuiltinFunction:
+
+    def __init__(self, name):
+        self.name = name
+
+    def __repr__(self):
+        return "<BuiltinFunction>"
+
+
+class Null:
+
+    def __repr__(self):
+        return "null"
+
+
+null = Null()
+
+
+class Boolean:
+
+    def __init__(self, value):
+        self.value = bool(value)
+
+    def __repr__(self):
+        return str(self.value).lower()
+
+    def __bool__(self):
+        return self.value
+
+    def __add__(self, other):
+        if type(other) != Boolean:
+            raise TypeError
+        return boolean(self.value and other.value)
+
+
+def boolean(val):
+    return true if val else false
+
+
+true = Boolean(True)
+false = Boolean(False)
+
+
+class Integer(int):
+    ...
+
+
+class Float(float):
+    ...
+
+
+class String(str):
+    ...
+
+
+class List(list):
+    ...
+
+
+def typeconversion(val):
+    if val is None:
+        return null
+    elif type(val) == bool:
+        return boolean(val)
+    elif type(val) == int:
+        return Integer(val)
+    elif type(val) == float:
+        return Float(val)
+    elif type(val) == str:
+        return String(val)
+    elif type(val) == list:
+        return List(val)
+    else:
+        return val
+
+
+# main code
+class EzyLang:
+
+    def __init__(self, filename: str, code=None, initscope="globals", parents=None, func=None):
+        self.file = filename
+        self.ast = {}
+        self.initscope = initscope
+        self.parents = parents or []
+        self.func = func
+
+        self.isfile = True
+        self.code = ""
+
+        if code is not None:
+            self.isfile = False
+            self.code = code
+        elif self.file.endswith(".ezy"):
+            with open(self.file, encoding="utf-8") as f:
+                self.code = f.read()
+
+        self.lines = self.code.split("\n")
+
+    def print_error(self, error: str, msg: str, lines: typing.Union[int, typing.List[int]]):
+        self.lines = [line.replace("\t", "    ") for line in self.lines]
+
+        if type(lines) == int:
+            lines = [lines]
+
+        dashes = "─" * (5 + max(30, len(max(self.lines[(1 if (lines[0] - 1) < 1 else (lines[0] - 1)) - 1:lines[-1] + 2], key=len))))
+        max_line = len(str(lines[-1] if lines[-1] == len(self.lines) else lines[-1] + 1))
+
+        if self.parents:
+            mainparent = self.parents[0].split(':')
+            main = mainparent[0] if mainparent[0].endswith(".ezyc") else self.parents[0]
+            file = f"Error in file {main}{''.join(f' in {parent}' for parent in self.parents[1:])} in {self.file}:{lines[0]}"
+        else:
+            pos = self.file if self.file.endswith(".ezyc") else f"{self.file}:{lines[0]}"
+            file = f"Error in file {pos}"
+
+        print(Fore.RED, end="")
+        print(file)
+        print(f"  {'':>{max_line}} ┌" + dashes)
+
+        if lines[0] == 2:
+            print(f"  {lines[0] - 1:>{max_line}} |   {self.lines[lines[0] - 2]}")
+        elif lines[0] > 2:
+            print(f"  {'':>{max_line}} :   ...")
+            print(f"  {lines[0] - 1:>{max_line}} :   {self.lines[lines[0] - 2]}")
+
+        for line in lines:
+            print(f"> {line:>{max_line}} │   {self.lines[line - 1]}")
+
+        if lines[-1] == len(self.lines) - 1:
+            print(f"  {lines[-1] + 1:>{max_line}} |   {self.lines[lines[-1]]}")
+        if lines[-1] < len(self.lines) - 1:
+            print(f"  {lines[-1] + 1:>{max_line}} :   {self.lines[lines[-1]]}")
+            print(f"  {'':>{max_line}} :   ...")
+
+        print(f"  {'':>{max_line}} └" + dashes)
+
+        if msg:
+            print(f"{error}: {msg}")
+        else:
+            print(error)
+
+        print(Style.RESET_ALL, end="")
+        exit(1)
+
+    def compile(self):
+        tokens = []
+        _tokens = []
+
+        string = False
+        string_value = ""
+        string_start = -1
+        escape = False
+
+        number = False
+        number_value = ""
+        floating_point = False
+
+        comment = False
+        comment_value = ""
+        comment_start = -1
+
+        indent = True
+        indent_value = 0
+        previous_indent = -1
+
+        symbol = ""
+
+        identifier = ""
+
+        def can_be_id(iden, c):
+            return c.isalpha() or c == '_' or (iden != "" and c.isnumeric())
+
+        for no, line in [(a + 1, b) for a, b in enumerate(self.lines)]:
+            for char in line + '\n':
+
+                _symbol = symbol
+
+                if indent:
+                    if char == ' ':
+                        indent_value += 1
+                        if not (string or comment):
+                            continue
+                    else:
+                        if previous_indent == indent_value:
+                            self.print_error(
+                                "IndentError", "Two consecutive lines must not have the same amount of leading spaces",
+                                [no - 1, no]
+                            )
+
+                        _tokens.append(Token("indent", indent_value, no))
+                        previous_indent = indent_value
+
+                        if char != '\n':
+                            indent = False
+                        indent_value = 0
+
+                if string:
+                    if char in '"\'`' and not escape:
+                        _tokens.append(Token("string", string_value, no))
+                        string_value = ""
+                        string = False
+
+                    elif char == '\\' and not escape:
+                        escape = True
+
+                    else:
+                        if char == '\n':
+                            indent = True
+
+                        if escape:
+                            if char == 'n':
+                                string_value += '\n'
+                            elif char == 't':
+                                string_value += '\t'
+
+                            elif char in '"\'`':
+                                string_value += char
+                            else:
+                                string_value += '\\' + char
+
+                            escape = False
+
+                        else:
+                            string_value += char
+
+                    continue
+
+                elif comment:
+                    if char == '#':
+                        _tokens.append(Token("comment", comment_value, no))
+                        comment_value = ""
+                        comment = False
+
+                    else:
+                        if char == '\n':
+                            indent = True
+
+                        comment_value += char
+
+                    continue
+
+                elif number:
+                    if char == '.':
+                        if floating_point:
+                            self.print_error(
+                                "SyntaxError", "Invalid syntax", no
+                            )
+                        else:
+                            floating_point = True
+                            number_value += char
+                            continue
+
+                    elif not char.isnumeric():
+                        if floating_point:
+                            _tokens.append(Token("float", float(number_value), no))
+                        else:
+                            _tokens.append(Token("int", int(number_value), no))
+
+                        number = False
+                        number_value = ""
+                        floating_point = False
+
+                if char in '"\'`':
+                    string = True
+                    string_start = no
+
+                elif char == '#':
+                    comment = True
+                    comment_start = no
+
+                else:
+                    if can_be_id(identifier, char):
+                        identifier += char
+                    else:
+                        if identifier:
+                            _tokens.append(Token("identifier", identifier, no))
+                            identifier = ""
+
+                        if char.isnumeric():
+                            number = True
+                            number_value += char
+
+                        else:
+                            if char in '()[]{}:?!.$':
+                                _tokens.append(Token("symbol", char, no))
+
+                            elif char in ';':
+                                _tokens.append(Token("char", char, no))
+
+                            elif char == ',':
+                                _tokens.append(Token("sep", char, no))
+
+                            elif char == '\n':
+                                if no != len(self.lines):
+                                    indent = True
+                                    _tokens.append(Token("char", char, no))
+
+                            elif not char.isspace():
+                                symbol += char
+
+                if _symbol == symbol != "":
+                    _tokens.insert(0, Token("symbol", symbol, no))
+                    symbol = ""
+
+                tokens.extend(_tokens)
+                _tokens = []
+
+        if comment:
+            self.print_error(
+                "EOFError", "EOF while parsing comment",
+                list(range(comment_start, len(self.lines) + 1))
+            )
+        if string:
+            self.print_error(
+                "EOFError", "EOF while parsing string",
+                list(range(string_start, len(self.lines) + 1))
+            )
+
+        for _ in copy.copy(tokens):
+            if _.type == "indent":
+                tokens.remove(_)
+
+        # ↑ tokens
+        # ↓ ast
+
+        ast = {
+            self.initscope: []
+        }
+
+        operators = ('+', '-', '*', '/', '**', '/~', '%', '\\=', '=/', '>', '<', '>>', '<<')
+        unary_operators = ('-', '!', '$')
+
+        def prev(_t):
+            if _t - 1 >= 0:
+                return tokens[_t - 1]
+            else:
+                return Token(None, None, None)
+
+        def curr(_t):
+            return tokens[_t]
+
+        # def after(_t):
+        #     if _t + 1 < len(tokens):
+        #         return tokens[_t + 1]
+        #     else:
+        #         return Token(None, None, None)
+
+        def lex(scope: Scope, t, end_condition=None):
+            def next_token() -> Token:
+                nonlocal t
+                t += 1
+                try:
+                    return tokens[t]
+                except IndexError:
+                    return Token(None, None, None)
+
+            def lex_until(cond, s=None):
+                nonlocal t
+
+                if callable(s):
+                    _scope = scope + scope.get_next_index(ast) + "args"
+                    _scope = s(_scope)
+                elif type(s) == str:
+                    _scope = scope + scope.get_next_index(ast) + s
+                elif s:
+                    _scope = s
+                else:
+                    _scope = scope + scope.get_next_index(ast) + "args"
+
+                t = lex(_scope, t, cond)
+
+            def ast_append(value: dict):
+                value["line"] = tokens[t].line
+
+                def add_lines(args: list):
+                    if args:
+                        for arg in args:
+                            arg["line"] = tokens[t].line
+                            add_lines(arg.get("args"))
+
+                add_lines(value.get("args"))
+
+                scope.get_ast_scope(ast).append(value)
+
+            def get_before(pop=True):
+                inner = scope.get_ast_scope(ast)
+                if inner:
+                    if pop:
+                        return inner.pop(-1)
+                    else:
+                        return inner[-1]
+
+            while True:
+                token = next_token()
+
+                # end of scope
+                if callable(end_condition) and end_condition(token):
+                    break
+
+                if type(end_condition) == str and token.value in set(end_condition):
+                    break
+
+                if t >= len(tokens):
+                    if type(end_condition) == str:
+                        if '\n' not in end_condition:
+                            self.print_error(
+                                "SyntaxError", f"Missing '{end_condition[0]}'", len(self.lines)
+                            )
+                    break
+
+                # words and stuff
+                if token.type == "identifier":
+
+                    # boolean
+                    if token.value in ("true", "false"):
+                        ast_append({
+                            "type": "constant",
+                            "value": {
+                                "type": "boolean",
+                                "value": True if token.value == "true" else False
+                            }
+                        })
+
+                    # null
+                    elif token.value == "null":
+                        ast_append({
+                            "type": "constant",
+                            "value": {
+                                "type": "null",
+                                "value": None
+                            }
+                        })
+
+                    # built-in function
+                    elif token.value in ("print", "input", "len", "exit", "func"):
+                        ast_append({
+                            "type": "builtin",
+                            "name": token.value
+                        })
+
+                    # variable
+                    else:
+                        def append_binop(index, op):
+                            ast_append({
+                                "type": "set",
+                                "index": index,
+                                "name": token.value,
+                                "args": [{
+                                    "type": "binop",
+                                    "operator": op,
+                                    "args": [{
+                                        "type": "get",
+                                        "name": token.value
+                                    }]
+                                }]
+                            })
+                            # noinspection PyTypeChecker
+                            lex_until(';\n', lambda s: s + 0 + "args")
+
+                        oper = next_token()
+
+                        # set variable
+                        if oper.value == '=' or any(str(oper.value).startswith(op) for op in (
+                                '==', *[op + '=' for op in operators]
+                        )):
+                            oper = oper.value
+
+                            if oper == '=' or oper.startswith('=='):
+                                ast_append({
+                                    "type": "set",
+                                    "index": oper.count('='),
+                                    "name": token.value,
+                                    "args": []
+                                })
+                                lex_until(';\n')
+
+                            elif oper.startswith('=/='):
+                                append_binop(oper.count('=') - 1, '=/')
+
+                            elif oper.startswith('\\=='):
+                                append_binop(oper.count('=') - 1, '\\=')
+
+                            else:
+                                append_binop(oper.count('='), oper[:-oper.count('=')])
+
+                        # get variable
+                        else:
+                            t -= 1  # no operator
+                            ast_append({
+                                "type": "get",
+                                "name": token.value
+                            })
+
+                # constants
+                elif token.type in ("string", "int", "float"):
+                    ast_append({
+                        "type": "constant",
+                        "value": {
+                            "type": token.type,
+                            "value": token.value
+                        }
+                    })
+
+                # list
+                elif token.value == '[':
+
+                    # indexing
+                    if get_before(pop=False) and str(prev(t).value) not in '\n;,':
+                        ast_append({
+                            "type": "index",
+                            "list": [get_before()],
+                            "args": []
+                        })
+                        lex_until(']')
+
+                    # definition
+                    else:
+                        ast_append({
+                            "type": "list",
+                            "args": []
+                        })
+                        lex_until(']')
+
+                elif token.value == '(':
+
+                    # function call
+                    if get_before(pop=False) and str(prev(t).value) not in '\n;,':
+                        ast_append({
+                            "type": "call",
+                            "func": [get_before()],
+                            "args": []
+                        })
+                        lex_until(')')
+
+                    # evaluate brackets first thingy
+                    else:
+                        ast_append({
+                            "type": "inner",
+                            "args": []
+                        })
+                        lex_until(')')
+
+                # function self-reference
+                elif token.value == '.':
+                    ast_append({
+                        "type": "self-func"
+                    })
+
+                elif token.value == '?':
+                    ast_append({
+                        "type": "cond",
+                        "cond": [],
+                        "true": [],
+                        "false": []
+                    })
+                    # noinspection PyTypeChecker
+                    lex_until('{', "cond")
+                    lex_until('?!', "true")
+                    if curr(t).value == '!':
+                        lex_until('?', "false")
+
+                # symbol
+                elif token.type == "symbol":
+
+                    # operator
+                    if token.value in operators:
+
+                        # TODO proper expression parsing (without '}' lmao)
+                        # TODO operator precedence
+
+                        # binary operator
+                        if get_before(pop=False):
+                            ast_append({
+                                "type": "binop",
+                                "operator": token.value,
+                                "args": [get_before()]
+                            })
+                            lex_until('}')  # change maybe
+
+                        # unary operator with same symbol as binary operator
+                        elif token.value in unary_operators:
+                            ast_append({
+                                "type": "unop",
+                                "operator": token.value,
+                                "args": []
+                            })
+                            lex_until('}')  # change maybe
+
+                        else:
+                            self.print_error(
+                                "SyntaxError", "Invalid syntax", token.line
+                            )
+
+                    # unary operator
+                    elif token.value in unary_operators:
+                        ast_append({
+                            "type": "unop",
+                            "operator": token.value,
+                            "args": []
+                        })
+                        lex_until('}')  # change maybe
+
+                    elif token.value == '<-':
+                        ast_append({
+                            "type": "return",
+                            "args": []
+                        })
+                        lex_until(';\n')
+
+                    # random symbol
+                    else:
+                        if token.value == '=' and get_before(pop=False):
+                            self.print_error(
+                                "SyntaxError", f"Cannot assign to '{prev(t).value}'", token.line
+                            )
+                        else:
+                            self.print_error(
+                                "SyntaxError", "Invalid syntax", token.line
+                            )
+
+                # random character
+                elif token.type == "char" and token.value != '\n':
+                    self.print_error(
+                        "SyntaxError", "Invalid syntax", token.line
+                    )
+
+            return t
+
+        lex(Scope(self.initscope), -1)
+
+        if self.isfile:
+            with open(self.file + "c", "wb") as f:
+                pickle.dump(ast, f)
+        else:
+            self.ast = ast
+
+        if DEBUG_MODE and self.isfile:
+            import json
+            with open(f"{self.file}-ast.json", "w") as f:
+                json.dump(ast, f, indent=2)
+
+            with open(f"{self.file}-tokens.txt", "w", encoding="utf-8") as f:
+                f.write("\n".join([f"{_.line:>3} | {_.type:>10} | {repr(_.value)}" for _ in tokens]))
+
+    def run(self, params=None, keep=False):
+        if not self.file.endswith(".ezyc") and not os.path.isfile(self.file + "c"):
+            self.compile()
+        else:
+            keep = True
+
+        ret = self.run_code(params, keep)
+
+        if not self.isfile:
+            return ret
+
+    def run_code(self, params, keep):
+        if self.isfile:
+            with open(self.file + "c" if self.file.endswith(".ezy") else self.file, "rb") as f:
+                ast = pickle.load(f)
+        else:
+            ast = self.ast
+
+        if self.isfile and self.file.endswith(".ezy") and not keep:
+            os.remove(self.file + "c")
+
+        variables = {}
+        func_return_values = []
+        if params is None:
+            params = []
+
+        returned = False
+
+        def run(scope: Scope):
+            nonlocal func_return_values
+            nonlocal returned
+
+            return_values = []
+
+            def calc(a, op, b=None):
+                def zdiverr():
+                    if b == 0:
+                        self.print_error("MathError", "Cannot divide by 0", entry["line"])
+
+                def floatify(val):
+                    if type(a) == Float or type(b) == Float:
+                        return Float(val)
+                    return Integer(val)
+
+                # unary
+                if b is None:
+                    try:
+                        if op == '!':
+                            if type(a) == Boolean:
+                                return boolean(not a)
+                            else:
+                                raise TypeError
+                        elif op == '-':
+                            return floatify(-a)
+                        elif op == '$':
+                            if type(a) != String:
+                                return String(a)
+                            try:
+                                r = Float(a)
+                                if r.is_integer():
+                                    return Integer(a)
+                                return r
+                            except ValueError:
+                                self.print_error(
+                                    "ValueError", f"Cannot use {op} on type '{a.__class__.__name__}' with value '{a}'", entry["line"]
+                                )
+
+                    except TypeError:
+                        self.print_error(
+                            "TypeError", f"Operator {op} on type '{a.__class__.__name__}' not supported", entry["line"]
+                        )
+
+                # binary
+                else:
+                    try:
+                        if op == '+':
+                            return type(a)(a + b)
+                        elif op == '-':
+                            return Integer(a - b)
+                        elif op == '*':
+                            if type(b) == Float:
+                                return Float(a * b)
+                            return type(a)(a * b)
+                        elif op == '/':
+                            zdiverr()
+                            return floatify(a / b)
+                        elif op == '**':
+                            return floatify(a ** b)
+                        elif op == '/~':
+                            zdiverr()
+                            return Integer(a // b)
+                        elif op == '%':
+                            zdiverr()
+                            return Integer(a % b)
+                        elif op == '\\=':
+                            return boolean(a == b)
+                        elif op == '=/':
+                            return boolean(a != b)
+                        elif op == '>':
+                            return boolean(a >= b)
+                        elif op == '<':
+                            return boolean(a <= b)
+                        elif op == '>>':
+                            return boolean(a > b)
+                        elif op == '<<':
+                            return boolean(a < b)
+
+                    except TypeError:
+                        self.print_error(
+                            "TypeError", f"'{a.__class__.__name__}' {op} '{b.__class__.__name__}' not supported", entry["line"]
+                        )
+
+            def getvar(name):
+                for var in variables.values():
+                    if name == var["name"]:
+                        val = var["value"]
+                        typeconversion(val)
+                        return val
+
+            def argcheck(got, expected):
+                if len(got) < expected:
+                    self.print_error(
+                        "ArgumentError",
+                        f"Function '{func.name}' expected {expected} argument{'s' if expected > 1 else ''}, got {len(got)}",
+                        entry["line"]
+                    )
+
+            def typecheck(_args, types):
+                for pos, _types in enumerate(types):
+                    msg = False
+                    if type(_types) != list:
+                        if type(_args[pos]) != _types:
+                            msg = f"Argument at pos {pos + 1} for function '{func.name}' expected type '{_types.__name__}', got '{_args[pos].__class__.__name__}'"
+
+                    elif type(_args[pos]) not in _types:
+                        if len(_types) == 1:
+                            msg = f"Argument at pos {pos + 1} for function '{func.name}' expected type '{_types[0].__name__}', got '{_args[pos].__class__.__name__}'"
+                        else:
+                            msg = f"""Argument at pos {pos + 1} for function '{func.name}' expected type '{"' or '".join(t.__name__ for t in types[pos])}', got '{_args[pos].__class__.__name__}'"""
+
+                    if msg:
+                        self.print_error("TypeError", msg, entry["line"])
+
+            for i, entry in enumerate(scope.get_ast_scope(ast)):
+                if not returned:
+
+                    # set variable
+                    if entry["type"] == "set":
+                        debug_print(f"{' ' * len(scope)}set", entry)
+                        value = run(scope + i + "args")
+
+                        if len(value) < 1:
+                            self.print_error(
+                                "SyntaxError", "Cannot assign nothing", entry["line"]
+                            )
+
+                        if len(value) > 1:
+                            self.print_error(
+                                "SyntaxError", "Invalid syntax", entry["line"]
+                            )
+
+                        value = value[0]
+
+                        variables[entry["index"]] = {
+                            "name": entry["name"],
+                            "value": value
+                        }
+
+                        # remove existing variable with same name
+                        for k, v in variables.items():
+                            if entry["name"] == v["name"] and k != entry["index"]:
+                                del variables[k]
+                                break
+
+                        return_values.append(value)
+
+                    # get variable
+                    elif entry["type"] == "get":
+                        debug_print(f"{' ' * len(scope)}get", entry)
+                        value = getvar(entry["name"])
+                        if value is None:
+                            self.print_error(
+                                "UndefinedError", f"Variable '{entry['name']}' is not defined", entry["line"]
+                            )
+                        return_values.append(value)
+
+                    # constant
+                    elif entry["type"] == "constant":
+                        debug_print(f"{' ' * len(scope)}const", entry)
+                        return_values.append(typeconversion(entry["value"]["value"]))
+
+                    # return value
+                    elif entry["type"] == "return":
+                        debug_print(f"{' ' * len(scope)}return", entry)
+                        func_return_values = run(scope + i + "args")
+                        returned = True
+
+                    # list definition
+                    elif entry["type"] == "list":
+                        debug_print(f"{' ' * len(scope)}list", entry)
+                        return_values.append(List(run(scope + i + "args")))
+
+                    # list indexing
+                    elif entry["type"] == "index":
+                        debug_print(f"{' ' * len(scope)}index", entry)
+                        lst = run(scope + i + "list")[0]
+                        ind = run(scope + i + "args")
+
+                        if type(lst) not in (String, List, Function):
+                            self.print_error(
+                                "TypeError", f"Type '{lst.__class__.__name__}' cannot be indexed", entry["line"]
+                            )
+
+                        if len(ind) != 1:
+                            self.print_error(
+                                "TypeError", f"List index expected 1 value, got {len(ind)}", entry["line"]
+                            )
+
+                        ind = ind[0]
+                        if type(lst) == Function:
+                            if lst.isref:
+                                lst = params
+                            else:
+                                self.print_error(
+                                    "TypeError", f"Type '{lst.__class__.__name__}' cannot be indexed outside function", entry["line"]
+                                )
+
+                        if type(ind) != Integer:
+                            self.print_error(
+                                "TypeError", f"List index expected type 'Integer', got '{ind.__class__.__name__}'", entry["line"]
+                            )
+
+                        if ind >= len(lst):
+                            self.print_error(
+                                "IndexError", f"List index out of range (index {ind}, length {len(lst)})", entry["line"]
+                            )
+
+                        return_values.append(typeconversion(lst[ind]))
+
+                    elif entry["type"] == "cond":
+                        debug_print(f"{' ' * len(scope)}cond", entry)
+
+                        cond = run(scope + i + "cond")
+                        if not cond:
+                            self.print_error(
+                                "SyntaxError", "Missing condition in if-statement", entry["line"]
+                            )
+
+                        if type(cond[0]) != Boolean:
+                            self.print_error(
+                                "TypeError",
+                                f"Condition in if-statement expected type 'Boolean', got '{cond[0].__class__.__name__}'",
+                                entry["line"]
+                            )
+
+                        if cond[0].value:
+                            run(scope + i + "true")
+                        else:
+                            run(scope + i + "false")
+
+                    # binary operation
+                    elif entry["type"] == "binop":
+                        debug_print(f"{' ' * len(scope)}binop", entry)
+                        args = run(scope + i + "args")
+
+                        if len(args) != 2:
+                            self.print_error(
+                                "SyntaxError", "Invalid syntax", entry["line"]
+                            )
+
+                        return_values.append(
+                            calc(args[0], entry["operator"], args[1])
+                        )
+
+                    # unary operation
+                    elif entry["type"] == "unop":
+                        debug_print(f"{' ' * len(scope)}unop", entry)
+                        args = run(scope + i + "args")
+
+                        if len(args) != 1:
+                            self.print_error(
+                                "SyntaxError", "Invalid syntax", entry["line"]
+                            )
+
+                        return_values.append(
+                            calc(args[0], entry["operator"])
+                        )
+
+                    # evaluate brackets first thingy
+                    elif entry["type"] == "inner":
+                        args = run(scope + i + "args")
+                        if len(args) == 1:
+                            return_values.append(args[0])
+                        elif len(args) > 1:
+                            self.print_error(
+                                "TypeError", "Multiple values found between non-calling parentheses", entry["line"]
+                            )
+                        else:
+                            return_values.append(null)
+
+                    # function self-reference
+                    elif entry["type"] == "self-func":
+                        debug_print(f"{' ' * len(scope)}self-func", entry)
+
+                        if "func" in scope:
+                            return_values.append(Function(None, None, None, isref=True))
+
+                        else:
+                            self.print_error(
+                                "SyntaxError", "Function self-reference outside function", entry["line"]
+                            )
+
+                    # built-in function
+                    elif entry["type"] == "builtin":
+                        debug_print(f"{' ' * len(scope)}builtin", entry)
+                        return_values.append(BuiltinFunction(entry["name"]))
+
+                    # function call
+                    elif entry["type"] == "call":
+                        debug_print(f"{' ' * len(scope)}call", entry)
+                        func = run(scope + i + "func")[0]
+
+                        # built-ins
+                        if type(func) == BuiltinFunction:
+
+                            if func.name == "print":
+                                output = run(scope + i + "args")
+                                argcheck(output, 1)
+                                typecheck(output, [String])
+
+                                print(output[0])
+                                return_values.append(typeconversion(output[0]))
+
+                            elif func.name == "input":
+                                args = run(scope + i + "args")
+                                typecheck(args, [String])
+
+                                inp = input(args[0] if args else "")
+                                return_values.append(typeconversion(inp))
+
+                            elif func.name == "len":
+                                args = run(scope + i + "args")
+                                argcheck(args, 1)
+                                typecheck(args, [[List, String]])
+
+                                return_values.append(typeconversion(len(args[0])))
+
+                            elif func.name == "exit":
+                                exit()
+
+                            elif func.name == "func":
+                                args = run(scope + i + "args")
+                                argcheck(args, 2)
+                                typecheck(args, [List, String])
+
+                                return_values.append(
+                                    Function(args[0], args[1],
+                                             parents=self.parents + [f"{self.file}:{entry['line']}"])
+                                )
+
+                        # other functions
+                        else:
+                            if type(func) != Function:
+                                self.print_error(
+                                    "TypeError", f"Type '{func.__class__.__name__}' cannot be called", entry["line"]
+                                )
+
+                            if func.isref:
+                                func = self.func
+
+                            args = run(scope + i + "args")
+                            p = copy.copy(func.params)
+
+                            for n, el in enumerate(args):
+                                if n < len(p):
+                                    p[n] = el
+
+                            try:
+                                ret = func.run(p)
+                                return_values.append(ret or null)
+                            except RecursionError:
+                                self.print_error(
+                                    "RecursionError", "Recursion limit reached", entry["line"]
+                                )
+
+            return return_values
+
+        run(Scope(self.initscope))
+        return typeconversion(func_return_values[0] if len(func_return_values) == 1 else func_return_values)
+
+
+cliargsparser = argparse.ArgumentParser(  # noqa
+    description="EZYlang is a programming language made by @kr8gz#1571 who doesn't know how to make programming languages.",
+    formatter_class=argparse.RawTextHelpFormatter
+)
+
+cliargsparser.add_argument('action',
+                           help="Must be one of the following: run, compile"
+                           )
+cliargsparser.add_argument('file',
+                           help="The EZY input file"
+                           )
+cliargsparser.add_argument('-k', '--keep',
+                           action="store_true",
+                           help="Whether to keep the .ezyc file after compiling when choosing 'run'"
+                           )
+cliargsparser.add_argument('-d', '--debug',
+                           action="store_true",
+                           help="Whether to run in 'Debug Mode'"
+                           )
+cliargs = cliargsparser.parse_args()
+
+
+def build_ezy(file):
+    if not file.endswith(".ezy") and not file.endswith(".ezyc"):
+        file += ".ezy"
+    if not os.path.isfile(file) and not file.endswith(".ezyc"):
+        file += "c"
+    if not os.path.isfile(file):
+        print("this file doesn't exist")
+        exit()
+    return EzyLang(file)
+
+
+if cliargs.debug:
+    DEBUG_MODE = True
+else:
+    # noinspection PyUnusedLocal
+    # dumb pycharm this thing takes 3 arguments
+    def exception_handler(exception_type, exception, traceback):
+        print(f"[Python error] {exception_type.__name__}: {exception}")
+
+    DEBUG_MODE = False
+    sys.excepthook = exception_handler
+
+if cliargs.action in ('run', 'r'):
+    build_ezy(cliargs.file).run(keep=cliargs.keep)
+
+elif cliargs.action in ('compile', 'comp', 'c'):
+    build_ezy(cliargs.file).compile()
+
+else:
+    cliargsparser.error("argument 'action' must be one of the following: run, compile")
